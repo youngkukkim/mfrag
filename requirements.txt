@@ -1,0 +1,11 @@
+numpy
+pandas
+torch
+torch-geometric
+dgl
+rdkit
+gym
+tqdm
+scipy
+scikit-learn
+matplotlib

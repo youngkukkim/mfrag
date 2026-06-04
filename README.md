@@ -39,3 +39,8 @@ python eval.py results/file_name.csv -t parp1
 ```
 
 Generated-molecule evaluation supports docking targets, QED, and SA.
+
+## Paper Results
+
+Machine-readable PMO/QED post hoc analysis outputs and representative molecule panels are available in `paper_results/pmo_qed/`.
+Large generated streams, full region-score annotations, and trained checkpoints are not stored in Git because of file size.

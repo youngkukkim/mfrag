@@ -43,4 +43,6 @@ Generated-molecule evaluation supports docking targets, QED, and SA.
 ## Paper Results
 
 Machine-readable PMO/QED post hoc analysis outputs and representative molecule panels are available in `paper_results/pmo_qed/`.
-Large generated streams, full region-score annotations, and trained checkpoints are not stored in Git because of file size.
+The PMO/QED files include the aggregate decile analysis, representative molecule selections, and the PDF/PNG figure panels used in the Supporting Information.
+Large generated streams, full region-score annotations, docking-score outputs, random-control indices, and trained checkpoints are not stored directly in Git because of file size.
+These files can be regenerated from the released scripts; versioned release assets accompanying the manuscript will provide generated SMILES, target scores, QED/SA values, novelty annotations, seeds, and evaluation summaries.

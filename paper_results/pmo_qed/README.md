@@ -10,6 +10,11 @@ This directory contains machine-readable outputs used for the PMO/QED post hoc a
 - `PMO_QED_mfrag_example_molecules.csv`
   - Representative low-, middle-, and high-region-score molecules used for the qualitative SI figure.
   - The `type` column records f-RAG provenance metadata from the original run and is not used as a visual label in the manuscript figure.
+- `PMO_QED_mfrag_fragment_trajectory_ablation_s2_runq09.csv`
+  - Per-oracle AUC top-10, top-10, and top-100 values for the PMO/QED fragment-region control analysis using the running \(q=0.9\) replay setting.
+  - Includes the full f-RAG stream, score-only, trajectory-only, score-plus-trajectory, and same-count random-control rows.
+- `PMO_QED_mfrag_fragment_trajectory_ablation_s2_w1000_q09.csv`
+  - Warm-up variant of the fragment-region control analysis where the first 1000 generated molecules are retained before applying the running \(q=0.9\) replay filter.
 - `figure/pmo_qed_mfrag_examples_part1.pdf`
   - Vector representative molecule panel for amlodipine, fexofenadine, osimertinib, and perindopril.
 - `figure/pmo_qed_mfrag_examples_part2.pdf`

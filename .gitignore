@@ -14,7 +14,6 @@ ckpt/
 oracle/*.pkl
 
 data/*.pt
-data/zinc250k.csv
 data/zinc250k.txt
 data/zinc250k_novelty.pt
 

@@ -112,7 +112,7 @@ class MFRAG(nn.Module):
                 node_input_dim=44,
                 edge_input_dim=10,
                 node_hidden_dim=44,
-                model_arch='dual'):
+                model_arch='shared'):
         super().__init__()
 
         self.device = device

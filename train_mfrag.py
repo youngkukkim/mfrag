@@ -550,7 +550,13 @@ def parse_args():
     parser.add_argument('--early_stop_patience', type=int, default=10)
     parser.add_argument('--min_delta', type=float, default=1e-5)
     parser.add_argument('--label_mode', type=str, default='reg', choices=['reg', 'cls'])
-    parser.add_argument('--model_arch', type=str, default='dual', choices=['shared', 'dual'])
+    parser.add_argument(
+        '--model_arch',
+        type=str,
+        default='shared',
+        choices=['shared', 'dual'],
+        help='Graph-encoder architecture. The paper configuration uses shared.',
+    )
     parser.add_argument('--train_mode', type=str, default='joint', choices=['joint', 'frag_only'])
     parser.add_argument('--delta', type=float, default=1.0,
                         help='Huber loss delta.')

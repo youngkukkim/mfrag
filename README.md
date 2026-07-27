@@ -19,8 +19,13 @@ python data_generate.py
 ## Training
 
 ```bash
-python train_mfrag.py -t parp1
+python train_mfrag.py -t parp1 --model_arch shared --train_mode joint
 ```
+
+The paper configuration uses one shared graph encoder for molecule and fragment
+inputs. The property-prediction and molecule--fragment alignment objectives
+jointly optimize this encoder. `shared` and `joint` are the defaults; they are
+shown explicitly above to make the reported configuration unambiguous.
 
 M-FRAG training supports docking targets, QED, SA, and MPO property targets.
 

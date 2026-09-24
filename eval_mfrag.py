@@ -34,7 +34,7 @@ def parse_args():
 
 
 def load_model(target: str, device: str):
-    ckpt = f"./ckpt/only/reg/{target}/epoch_10.pt"
+    ckpt = f"./ckpt/reg/{target}/best.pt"
     model = MFRAG(device=device).to(device)
     state = torch.load(ckpt, map_location=device)
     model.load_state_dict(state["state_dict"])

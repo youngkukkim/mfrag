@@ -3,6 +3,8 @@ import torch
 import gym
 import argparse
 import pickle
+import math
+import json
 
 from model.sac import SAC
 from utils_sac.utils import set_seed, get_vocab
@@ -16,7 +18,7 @@ AUX_TARGETS = ['qed', 'sa']
 TARGETS = DOCKING_TARGETS + AUX_TARGETS
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('-g', '--gpu_id', type=int, default=-1)
     parser.add_argument('-s', '--seed', type=int, default=0)
@@ -55,6 +57,11 @@ def main():
     parser.add_argument('--ecfp_weight', type=float, default=1.0)
     parser.add_argument('--sp_weight', type=float, default=1.0)
     parser.add_argument('--disable_region_guidance', action='store_true')
+    parser.add_argument('--fragment_selection_mode', default='hybrid',
+                        choices=['hybrid', 'sac_only', 'mfrag_only'],
+                        help='Fragment identity after random warmup; attachment sites still use SAC.')
+    parser.add_argument('--gumbel_noise_scale', type=float, default=1e-3,
+                        help='Gumbel noise multiplier at all three action stages (1.0: unscaled).')
     parser.add_argument('--region_train_sample_size', type=int, default=1000)
     parser.add_argument('--region_high_score_quantile', type=float, default=0.95)
     parser.add_argument('--region_knn_k', type=int, default=40)
@@ -63,7 +70,7 @@ def main():
     parser.add_argument('--region_generated_max', type=int, default=5000)
     parser.add_argument('--mfrag_ckpt', type=str, default='',
                         help='Explicit MFRAG checkpoint path. Overrides mfrag_root/label/ckpt_name.')
-    parser.add_argument('--mfrag_root', type=str, default='ckpt/only2')
+    parser.add_argument('--mfrag_root', type=str, default='ckpt')
     parser.add_argument('--mfrag_label_mode', type=str, default='reg', choices=['reg', 'cls'])
     parser.add_argument('--mfrag_ckpt_name', type=str, default='best.pt')
     parser.add_argument('--mfrag_model_arch', type=str, default='auto',
@@ -75,11 +82,38 @@ def main():
     parser.add_argument('--mfrag_finetune_epochs', type=int, default=3)
     parser.add_argument('--mfrag_finetune_batch_size', type=int, default=512)
     parser.add_argument('--mfrag_finetune_lr', type=float, default=1e-4)
+    parser.add_argument('--mfrag_finetune_loss', default='huber', choices=['huber', 'mse'],
+                        help='Property-prediction loss for optional M-FRAG fine-tuning.')
+    parser.add_argument('--mfrag_finetune_delta', type=float, default=1.0,
+                        help='Positive Huber transition threshold; ignored for MSE.')
     parser.add_argument('--mfrag_finetune_generated_top_frac', type=float, default=0.4)
     parser.add_argument('--mfrag_finetune_generated_random_frac', type=float, default=0.2)
     parser.add_argument('--mfrag_finetune_zinc_top_frac', type=float, default=0.2)
     parser.add_argument('--mfrag_finetune_zinc_random_frac', type=float, default=0.2)
-    args = parser.parse_args()
+    return parser
+
+
+def validate_args(parser, args):
+    if not math.isfinite(args.mfrag_finetune_delta) or args.mfrag_finetune_delta <= 0:
+        parser.error('--mfrag_finetune_delta must be finite and positive')
+    if not math.isfinite(args.gumbel_noise_scale) or args.gumbel_noise_scale < 0:
+        parser.error('--gumbel_noise_scale must be finite and non-negative')
+    if args.disable_region_guidance:
+        if args.fragment_selection_mode == 'mfrag_only':
+            parser.error('--disable_region_guidance is incompatible with mfrag_only')
+        args.fragment_selection_mode = 'sac_only'
+    args.disable_region_guidance = args.fragment_selection_mode == 'sac_only'
+    return args
+
+
+def parse_args(argv=None):
+    parser = build_parser()
+    return validate_args(parser, parser.parse_args(argv))
+
+
+def main(args=None):
+    if args is None:
+        args = parse_args()
     print(args)
     
     if args.gpu_id >= 0:
@@ -101,6 +135,8 @@ def main():
     env.seed(args.seed)
 
     sac = SAC(args, vocab, env)
+    with open(sac.fname[:-4] + '_settings.json', 'w') as f:
+        json.dump(vars(args), f, indent=2, sort_keys=True, default=str)
     with open(sac.fname[:-4]+".pkl", 'wb') as f:
     	pickle.dump(sac.vocab['FRAG_QUEUE'], f)
     sac.run()

@@ -41,7 +41,7 @@ def get_fragment_smiles(smiles: str) -> Tuple[str, List[str], str]:
 
 
 def load_mfrag(target: str, device: str):
-    ckpt = f"./ckpt/only/reg/{target}/epoch_10.pt"
+    ckpt = f"./ckpt/reg/{target}/best.pt"
     model = MFRAG(device=device).to(device)
     state_dict = torch.load(ckpt, map_location=device)["state_dict"]
     model.load_state_dict(state_dict)

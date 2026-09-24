@@ -117,7 +117,13 @@ class SFSPolicy(nn.Module):
         self.sp_weight = getattr(args, 'sp_weight', 1.0)
         self.frag_desc_dim = get_frag_desc_dim(args)
         self.mfrag = None
-        self.region_guidance_enabled = not getattr(args, 'disable_region_guidance', False)
+        self.fragment_selection_mode = getattr(args, 'fragment_selection_mode', 'hybrid')
+        if getattr(args, 'disable_region_guidance', False):
+            self.fragment_selection_mode = 'sac_only'
+        self.gumbel_noise_scale = float(getattr(args, 'gumbel_noise_scale', 1e-3))
+        self.region_guidance_enabled = self.fragment_selection_mode != 'sac_only'
+        self.constraint_guidance_enabled = bool(getattr(args, 'enable_constrained_mfrag_guidance', False))
+        self.constraint_region_guides = {}
         self.region_knn_k = getattr(args, 'region_knn_k', 40)
         self.region_score_mode = getattr(args, 'region_score_mode', 'knn')
         self.region_ref_embeddings = None
@@ -177,6 +183,8 @@ class SFSPolicy(nn.Module):
         self.motif_type_num = len(self.cand)
         self.cand_ecfp = self.get_candidate_ecfp()
         self.cand_mfrag = self.get_candidate_mfrag_embedding() if self.mfrag is not None else None
+        for guide in self.constraint_region_guides.values():
+            guide['candidate_embeddings'] = self.get_candidate_mfrag_embedding(guide['model'])
         self.ac3_att_len = torch.LongTensor([len(x['att']) 
                                 for x in self.cand]).to(self.device)
         self.ac3_att_mask = torch.cat([torch.LongTensor([i]*len(x['att'])) 
@@ -188,6 +196,21 @@ class SFSPolicy(nn.Module):
 
     def set_score_predictor(self, score_predictor):
         self.set_mfrag(score_predictor)
+
+    def set_constraint_region_guide(self, name, model, reference_embeddings,
+                                    reference_scores, cutoff, knn_k=40):
+        embeddings = torch.as_tensor(reference_embeddings, dtype=torch.float32, device=self.device)
+        scores = torch.as_tensor(reference_scores, dtype=torch.float32, device=self.device).view(-1)
+        candidates = self.get_candidate_mfrag_embedding(model)
+        if (embeddings.ndim != 2 or embeddings.size(0) == 0
+                or embeddings.size(0) != scores.numel()
+                or embeddings.size(1) != candidates.size(1)
+                or not torch.isfinite(embeddings).all() or not torch.isfinite(scores).all()):
+            raise ValueError('Invalid {} region reference'.format(name))
+        self.constraint_region_guides[name] = {
+            'model': model, 'reference_embeddings': embeddings, 'reference_scores': scores,
+            'candidate_embeddings': candidates, 'cutoff': float(cutoff), 'knn_k': int(knn_k),
+        }
 
     def set_region_reference(self, embeddings, scores, knn_k=None, high_mask=None, score_mode=None):
         if embeddings is None or scores is None or len(embeddings) == 0:
@@ -230,17 +253,18 @@ class SFSPolicy(nn.Module):
             device=self.device,
         )
 
-    def get_candidate_mfrag_embedding(self):
-        if self.mfrag is None:
+    def get_candidate_mfrag_embedding(self, model=None):
+        model = self.mfrag if model is None else model
+        if model is None:
             return torch.zeros((self.motif_type_num, 128), dtype=torch.float32, device=self.device)
 
         frag_graphs = [get_graph_from_frag(x['smi']) for x in self.cand]
         frag_batch = Batch.from_data_list(frag_graphs).to(self.device)
         with torch.no_grad():
-            if hasattr(self.mfrag, 'encode_frag'):
-                frag_embedding = self.mfrag.encode_frag(frag_batch)
+            if hasattr(model, 'encode_frag'):
+                frag_embedding = model.encode_frag(frag_batch)
             else:
-                _, frag_embedding = self.mfrag(frag_batch)
+                _, frag_embedding = model(frag_batch)
         return frag_embedding
 
     def get_candidate_descriptors(self):
@@ -297,7 +321,14 @@ class SFSPolicy(nn.Module):
 
     def get_region_guided_logits(self, current_att_count, fallback_logits):
         if not self.has_region_guidance():
+            if self.region_guidance_enabled and self.fragment_selection_mode == 'mfrag_only':
+                raise RuntimeError('M-FRAG-only selection requires an initialized region reference')
             return fallback_logits
+        if self.constraint_guidance_enabled:
+            for name in ('qed', 'sa'):
+                guide = self.constraint_region_guides.get(name)
+                if guide is None or guide['candidate_embeddings'].size(0) != self.motif_type_num:
+                    raise RuntimeError('Missing or stale {} region guide'.format(name))
 
         try:
             _, current_final_smiles = self.env.get_final_smiles_mol()
@@ -312,24 +343,53 @@ class SFSPolicy(nn.Module):
                 ) / float(fragment_count + 1)
                 candidate_scores = self.query_region_scores(mixed_emb)
                 improvements = candidate_scores - current_score
+                constraint_mask = torch.ones_like(improvements, dtype=torch.bool)
+                if self.constraint_guidance_enabled:
+                    for name in ('qed', 'sa'):
+                        guide = self.constraint_region_guides[name]
+                        _, current_constraint_emb = guide['model'](current_batch)
+                        mixed_constraint_emb = (
+                            current_constraint_emb * float(fragment_count)
+                            + guide['candidate_embeddings']
+                        ) / float(fragment_count + 1)
+                        scores = self._query_reference_scores(
+                            mixed_constraint_emb, guide['reference_embeddings'],
+                            guide['reference_scores'], guide['knn_k'])
+                        constraint_mask &= scores >= guide['cutoff']
         except Exception:
+            if self.fragment_selection_mode == 'mfrag_only':
+                viable = self.get_fragment_viability_mask([current_att_count]).squeeze(0)
+                return torch.zeros_like(fallback_logits).masked_fill(~viable, -1e9)
             return fallback_logits
 
         viable_mask = self.get_fragment_viability_mask([current_att_count]).squeeze(0)
         improving_mask = improvements > 0
-        guided_mask = viable_mask & improving_mask
+        guided_mask = viable_mask & improving_mask & constraint_mask
 
         guided_logits = torch.full_like(fallback_logits, -1e9)
         if torch.any(guided_mask):
             guided_logits[guided_mask] = improvements[guided_mask]
             return guided_logits
         if torch.any(viable_mask):
-            guided_logits[viable_mask] = fallback_logits[viable_mask]
+            if self.fragment_selection_mode == 'mfrag_only':
+                guided_logits[viable_mask] = improvements[viable_mask]
+            else:
+                guided_logits[viable_mask] = fallback_logits[viable_mask]
             return guided_logits
         return fallback_logits
 
+    @staticmethod
+    def _query_reference_scores(query_embeddings, reference_embeddings, reference_scores, knn_k):
+        k = min(max(int(knn_k), 1), reference_embeddings.size(0))
+        distances = torch.cdist(query_embeddings, reference_embeddings)
+        knn_dist, knn_idx = torch.topk(distances, k=k, dim=-1, largest=False)
+        weights = 1.0 / (knn_dist + 1e-6)
+        return (weights * reference_scores[knn_idx]).sum(dim=-1) / weights.sum(dim=-1)
+
     def gumbel_softmax(self, logits: torch.Tensor, tau: float = 1, hard: bool = False, eps: float = 1e-10, dim: int = -1,\
-                    g_ratio: float = 1e-3) -> torch.Tensor:
+                    g_ratio=None) -> torch.Tensor:
+        if g_ratio is None:
+            g_ratio = self.gumbel_noise_scale
         gumbels = (
             -torch.empty_like(logits, memory_format=torch.legacy_contiguous_format).exponential_().log()
         )                
@@ -440,7 +500,7 @@ class SFSPolicy(nn.Module):
 
         logit_second = self.action2_layers[3](emb_cat).squeeze(-1)
         viable_mask = self.get_fragment_viability_mask(current_att_counts)
-        if g.batch_size == 1 and self.has_region_guidance():
+        if g.batch_size == 1 and self.region_guidance_enabled:
             fallback_logits = logit_second.squeeze(0).masked_fill(~viable_mask.squeeze(0), -1e9)
             logit_second = self.get_region_guided_logits(current_att_counts[0], fallback_logits).unsqueeze(0)
         else:
@@ -448,7 +508,7 @@ class SFSPolicy(nn.Module):
         ac_second_prob = F.softmax(logit_second, dim=-1) + 1e-8
         log_ac_second_prob = ac_second_prob.log()
         
-        ac_second_hot = self.gumbel_softmax(ac_second_prob, tau=self.tau, hard=True, g_ratio=1e-3)                                    
+        ac_second_hot = self.gumbel_softmax(ac_second_prob, tau=self.tau, hard=True)
         emb_second = torch.matmul(ac_second_hot, cand_graph_emb)
         ac_second = torch.argmax(ac_second_hot, dim=-1)
         ac_second_desc = torch.matmul(ac_second_hot, cand_desc)
@@ -580,7 +640,7 @@ class SFSPolicy(nn.Module):
         ac_second_prob = F.softmax(logit_second, dim=-1) + 1e-8
         log_ac_second_prob = ac_second_prob.log()
         
-        ac_second_hot = self.gumbel_softmax(ac_second_prob, tau=self.tau, hard=True, g_ratio=1e-3)                                    
+        ac_second_hot = self.gumbel_softmax(ac_second_prob, tau=self.tau, hard=True)
         emb_second = torch.matmul(ac_second_hot, cand_graph_emb)
         ac_second_desc = torch.matmul(ac_second_hot, cand_desc)
 

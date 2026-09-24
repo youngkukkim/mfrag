@@ -257,12 +257,53 @@ class SAC:
             self.region_train_high_mask = torch.zeros((0,), dtype=torch.bool)
             self.region_train_smiles = []
 
+        if getattr(args, 'enable_constrained_mfrag_guidance', False):
+            self._configure_constraint_guidance()
+
+    def _configure_constraint_guidance(self):
+        from utils_mfrag.benchmark import load_benchmark_reference, load_scalar_mfrag
+
+        for name in ('qed', 'sa'):
+            checkpoint = getattr(self.args, name + '_mfrag_ckpt')
+            reference = os.path.join(self.args.constraint_embedding_dir, name + '.npz')
+            embeddings, scores = load_benchmark_reference(reference, checkpoint, name)
+            model = load_scalar_mfrag(checkpoint, self.device, self.args.mfrag_model_arch)
+            self.ac.pi.set_constraint_region_guide(
+                name, model, embeddings, scores,
+                getattr(self.args, name + '_region_cutoff'), self.args.constraint_knn_k)
+            print('[MFRAG benchmark] {} references={} cutoff={}'.format(
+                name, len(scores), getattr(self.args, name + '_region_cutoff')))
+
+    def _ga_parent_mask(self, qed_scores, sa_scores):
+        qed_scores = np.asarray(qed_scores, dtype=np.float32)
+        sa_scores = np.asarray(sa_scores, dtype=np.float32)
+        if qed_scores.shape != sa_scores.shape or qed_scores.ndim != 1:
+            raise ValueError('GA QED and SA arrays must have matching one-dimensional shapes')
+        if not getattr(self.args, 'ga_qed_sa_gate', False):
+            return np.ones(qed_scores.shape, dtype=bool)
+        return (np.isfinite(qed_scores) & np.isfinite(sa_scores)
+                & (qed_scores > self.args.ga_qed_threshold)
+                & (sa_scores > self.args.ga_sa_threshold))
+
+    def _update_ga_population(self, mols, learning_scores, qed_scores, sa_scores):
+        parent_mask = self._ga_parent_mask(qed_scores, sa_scores)
+        if len(mols) != len(parent_mask) or len(mols) != len(learning_scores):
+            raise ValueError('GA population inputs must have equal lengths')
+        if getattr(self.args, 'ga_qed_sa_gate', False):
+            parent_mask &= np.asarray([mol is not None for mol in mols], dtype=bool)
+        self.population.extend(mol for mol, keep in zip(mols, parent_mask) if keep)
+        self.population_score.extend(score for score, keep in zip(learning_scores, parent_mask) if keep)
+        ranked = sorted(zip(self.population, self.population_score),
+                        key=lambda pair: pair[1], reverse=True)[:self.population_size]
+        self.population = [pair[0] for pair in ranked]
+        self.population_score = [pair[1] for pair in ranked]
+
     def _resolve_mfrag_ckpt(self, args):
         explicit_ckpt = getattr(args, 'mfrag_ckpt', '')
         if explicit_ckpt:
             return explicit_ckpt
         return os.path.join(
-            getattr(args, 'mfrag_root', 'ckpt/only2'),
+            getattr(args, 'mfrag_root', 'ckpt'),
             getattr(args, 'mfrag_label_mode', 'reg'),
             args.target,
             getattr(args, 'mfrag_ckpt_name', 'best.pt'),
@@ -288,7 +329,14 @@ class SAC:
         ew = getattr(args, 'ecfp_weight', 1.0)
         sw = getattr(args, 'sp_weight', 1.0)
         reward_suffix = 'target'
-        return f'{mode}_d{dim}_ew{ew:g}_sw{sw:g}_rw{reward_suffix}'
+        suffix = f'{mode}_d{dim}_ew{ew:g}_sw{sw:g}_rw{reward_suffix}'
+        if getattr(args, 'ga_qed_sa_gate', False):
+            suffix += '_benchmark'
+        selection = getattr(args, 'fragment_selection_mode', 'hybrid')
+        noise = getattr(args, 'gumbel_noise_scale', 1e-3)
+        if selection != 'hybrid' or noise != 1e-3:
+            suffix += f'_{selection}_g{noise:g}'
+        return suffix
 
     def _canonicalize_smiles(self, smiles):
         mol = Chem.MolFromSmiles(smiles)
@@ -540,7 +588,10 @@ class SAC:
         self._refresh_region_reference()
 
     def _run_mfrag_finetune(self, samples, composition):
-        from train_mfrag import collate_mfrag_batch, mean_pool_frag_embeddings, ContinuousContrastiveLoss
+        from train_mfrag import (
+            build_property_loss, collate_mfrag_batch,
+            mean_pool_frag_embeddings, ContinuousContrastiveLoss,
+        )
 
         if len(samples) == 0:
             print('[MFRAG fine-tune] skip: no usable samples', flush=True)
@@ -562,7 +613,10 @@ class SAC:
             flush=True,
         )
 
-        pred_loss_fn = torch.nn.HuberLoss(delta=1.0)
+        pred_loss_fn = build_property_loss(
+            'reg', getattr(self.args, 'mfrag_finetune_loss', 'huber'),
+            float(getattr(self.args, 'mfrag_finetune_delta', 1.0)),
+        )
         ctr_loss_fn = ContinuousContrastiveLoss(temperature=0.1, label_temperature=0.1)
         optimizer = Adam(self.mfrag.parameters(), lr=float(getattr(self.args, 'mfrag_finetune_lr', 1e-4)))
         batch_size = int(getattr(self.args, 'mfrag_finetune_batch_size', 512))
@@ -1054,12 +1108,7 @@ class SAC:
                         self.update_vocab(mols[n_sac_smi:], learning_scores[n_sac_smi:])
                     print(self.t, self.start_steps, self.update_after)
                                             
-                    self.population.extend(mols)
-                    self.population_score.extend(learning_scores)
-                    population_tuples = list(zip(self.population, self.population_score))
-                    population_tuples = sorted(population_tuples, key=lambda x: x[1], reverse=True)[:self.population_size]
-                    self.population = [t[0] for t in population_tuples]
-                    self.population_score = [t[1] for t in population_tuples]
+                    self._update_ga_population(mols, learning_scores, rews[1], rews[2])
 
                     num_generated = num_generated + n_smi
                     pbar.update(n_smi)

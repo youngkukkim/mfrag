@@ -1,6 +1,7 @@
 import argparse
 import gc
 import json
+import math
 import os
 import random
 import time
@@ -68,6 +69,20 @@ def build_targets(target_name: str, raw_target: float) -> Tuple[float, float]:
     return float(reg_target), float(cls_target)
 
 
+def build_property_loss(label_mode: str, regression_loss: str = 'huber', delta: float = 1.0):
+    if label_mode == 'reg':
+        if regression_loss == 'mse':
+            return torch.nn.MSELoss()
+        if regression_loss == 'huber':
+            if not math.isfinite(delta) or delta <= 0:
+                raise ValueError('Huber delta must be finite and positive')
+            return torch.nn.HuberLoss(delta=delta)
+        raise ValueError(f'Unsupported regression loss: {regression_loss}')
+    if label_mode == 'cls':
+        return torch.nn.BCEWithLogitsLoss()
+    raise ValueError(f'Unsupported label mode: {label_mode}')
+
+
 class DockingDataset(Dataset):
     def __init__(self, dataset, target: str):
         self.dataset = dataset
@@ -87,6 +102,11 @@ class DockingDataset(Dataset):
 
     def __getitem__(self, idx):
         graph, frag_list, value = self.dataset[idx]
+        if frag_list is None or len(frag_list) == 0:
+            raise ValueError(
+                f"Dataset sample {idx} has no fragments; zero-fragment samples "
+                "cannot be used for molecule-fragment alignment."
+            )
         frags_num = len(frag_list)
         raw_target = float(value[self.target])
         reg_target, cls_target = build_targets(self.target, raw_target)
@@ -101,6 +121,15 @@ class DockingDataset(Dataset):
 
 def collate_mfrag_batch(samples):
     graphs, frag_lists, frags_num, reg_target, cls_target = zip(*samples)
+    zero_fragment_positions = [
+        index for index, count in enumerate(frags_num) if int(count) <= 0
+    ]
+    if zero_fragment_positions:
+        raise ValueError(
+            "Zero-fragment samples found at batch positions {}.".format(
+                zero_fragment_positions
+            )
+        )
     flat_frags = [frag for frag_list in frag_lists for frag in frag_list]
     graph_batch = Batch.from_data_list(list(graphs))
     frag_batch = Batch.from_data_list(flat_frags) if len(flat_frags) > 0 else None
@@ -121,6 +150,25 @@ def mean_pool_frag_embeddings(frag_embeddings: torch.Tensor, frag_group_sizes) -
 
     if len(group_sizes) == 0:
         return frag_embeddings.new_zeros((0, frag_embeddings.size(-1)))
+
+    zero_fragment_positions = [
+        index for index, count in enumerate(group_sizes) if count <= 0
+    ]
+    if zero_fragment_positions:
+        raise ValueError(
+            "Fragment group sizes must be positive; invalid positions: {}.".format(
+                zero_fragment_positions
+            )
+        )
+
+    expected_fragments = sum(group_sizes)
+    actual_fragments = int(frag_embeddings.size(0))
+    if expected_fragments != actual_fragments:
+        raise ValueError(
+            "Fragment group sizes sum to {}, but {} embeddings were provided.".format(
+                expected_fragments, actual_fragments
+            )
+        )
 
     splits = torch.split(frag_embeddings, group_sizes, dim=0)
     pooled = [split.mean(dim=0) for split in splits]
@@ -550,6 +598,10 @@ def parse_args():
     parser.add_argument('--early_stop_patience', type=int, default=10)
     parser.add_argument('--min_delta', type=float, default=1e-5)
     parser.add_argument('--label_mode', type=str, default='reg', choices=['reg', 'cls'])
+    parser.add_argument('--regression_loss', default='huber', choices=['huber', 'mse'],
+                        help='Property-prediction loss for regression training.')
+    parser.add_argument('--delta', type=float, default=1.0,
+                        help='Positive Huber transition threshold; ignored for MSE.')
     parser.add_argument(
         '--model_arch',
         type=str,
@@ -558,8 +610,6 @@ def parse_args():
         help='Graph-encoder architecture. The paper configuration uses shared.',
     )
     parser.add_argument('--train_mode', type=str, default='joint', choices=['joint', 'frag_only'])
-    parser.add_argument('--delta', type=float, default=1.0,
-                        help='Huber loss delta.')
     parser.add_argument('--distance_mode', type=str, default='l2', choices=['none', 'l2'])
     parser.add_argument('--frag_distance_weight', type=float, default=0.1)
     parser.add_argument('--frag_ctr_weight', type=float, default=0.1)
@@ -575,12 +625,15 @@ def parse_args():
     parser.add_argument('--plot_sample_size', type=int, default=3000)
     parser.add_argument('--plot_test_sample_size', type=int, default=3000)
     parser.add_argument('--plot_fragment_sample_size', type=int, default=10000)
-    parser.add_argument('--out_root', type=str, default='ckpt/only')
+    parser.add_argument('--out_root', type=str, default='ckpt')
     parser.add_argument('--mol_ckpt', type=str, default='')
     parser.add_argument('--mol_ckpt_root', type=str, default='')
     parser.add_argument('--freeze_mol_encoder', action='store_true')
     parser.add_argument('--freeze_mol_gather', action='store_true')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not math.isfinite(args.delta) or args.delta <= 0:
+        parser.error('--delta must be finite and positive')
+    return args
 
 
 def main():
@@ -672,11 +725,10 @@ def main():
         raise ValueError('No trainable parameters.')
     optimizer = optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, patience=args.patience, mode='min', verbose=True)
+    pred_loss_fn = build_property_loss(args.label_mode, args.regression_loss, args.delta)
     if args.label_mode == 'reg':
-        pred_loss_fn = torch.nn.HuberLoss(delta=args.delta)
         contrastive_source_values = train_data.reg_target_values
     else:
-        pred_loss_fn = torch.nn.BCEWithLogitsLoss()
         contrastive_source_values = train_data.cls_target_values
 
     if args.ctr_mode == 'cls':

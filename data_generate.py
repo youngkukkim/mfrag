@@ -168,6 +168,10 @@ def build_dataset(df):
             continue
         frag_list = [get_graph_from_frag(item) for item in smiles_breaker(smiles)]
         frag_list = [frag for frag in frag_list if frag is not None]
+        if len(frag_list) == 0:
+            raise ValueError(
+                f"Molecule at row {idx} produced no valid fragments: {smiles}"
+            )
         value = {target: row[target] for target in TARGET_COLUMNS}
         value['smiles'] = smiles
         processed.append((graph, frag_list, value))

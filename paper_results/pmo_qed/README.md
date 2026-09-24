@@ -24,4 +24,4 @@ This directory contains machine-readable outputs used for the PMO/QED post hoc a
 - `figure/pmo_qed_mfrag_examples_part2.png`
   - PNG preview of the corresponding vector PDF panel.
 
-Large generated streams, checkpoints, and full region-score annotation files are excluded from the Git repository because of file size. They can be regenerated from the scripts in this repository or distributed separately as archival release assets.
+Large generated streams, checkpoints, and full region-score annotation files are excluded from the Git repository because of file size.
